@@ -1,0 +1,49 @@
+services:
+  mariadb:
+    image: docker.io/mariadb
+    environment:
+      - MYSQL_ROOT_PASSWORD=domjudge
+      - MYSQL_USER=domjudge
+      - MYSQL_PASSWORD=domjudge
+      - MYSQL_DATABASE=domjudge
+    ports:
+      - 127.0.0.1:13306:3306
+    command: --max-connections=1000 --max-allowed-packet=512M --innodb_snapshot_isolation=OFF
+    volumes:
+      - mariadb_data:/var/lib/mysql   # ✅ 이름 있는 볼륨으로 변경
+  domserver:
+    image: docker.io/domjudge/domjudge-contributor
+    hostname: domserver
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - .:${PWD}
+      - /chroot
+      - domserver_etc:/opt/domjudge/domserver/etc   # ✅ admin/restapi secret 유지
+    ports:
+      - 12345:80
+    privileged: true
+    cgroup: host
+    working_dir: ${PWD}
+    environment:
+      - PROJECT_DIR=${PWD}
+  judgehost:
+    image: docker.io/domjudge/judgehost
+    hostname: domjudge-judgehost
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - .:${PWD}
+      - /chroot
+    ports:
+      - 12346:80
+    privileged: true
+    cgroup: host
+    working_dir: ${PWD}
+    environment:
+      - JUDGEDAEMON_USERNAME=judgehost
+      - DAEMON_ID=0
+      - JUDGEDAEMON_PASSWORD=XwIzchwuEylxQGx+WVJC5tW90Sj/Vk70
+
+volumes:   # ✅ 여기 추가
+  mariadb_data:
+  domserver_etc:
+
