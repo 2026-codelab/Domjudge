@@ -4,11 +4,13 @@ namespace App\Controller\API;
 
 use App\DataTransferObject\JudgingWrapper;
 use App\Entity\Judging;
+use App\Entity\Testcase;
 use App\Service\ConfigurationService;
 use App\Service\DOMJudgeService;
 use App\Service\EventLogService;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\NonUniqueResultException;
+use Doctrine\ORM\Query\Expr\Join;
 use Doctrine\ORM\QueryBuilder;
 use FOS\RestBundle\Controller\Annotations as Rest;
 use Nelmio\ApiDocBundle\Attribute\Model;
@@ -16,6 +18,7 @@ use OpenApi\Attributes as OA;
 use Symfony\Component\ExpressionLanguage\Expression;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\Security\Http\Attribute\IsGranted;
 
 /**
@@ -96,6 +99,75 @@ class JudgementController extends AbstractRestController implements QueryObjectT
     public function singleAction(Request $request, string $id): Response
     {
         return parent::performSingleAction($request, $id);
+    }
+
+    /**
+     * H-CodeLab connector custom endpoint.
+     * The stock DOMjudge API has no endpoint exposing per-testcase actual output/diff/compile
+     * log, so this mirrors the query Team/SubmissionController uses and exposes it as JSON.
+     * @throws NonUniqueResultException
+     */
+    #[IsGranted(new Expression("is_granted('ROLE_JURY') or is_granted('ROLE_API_READER')"))]
+    #[Rest\Get('contests/{cid}/judgements/{id<\d+>}/detail')]
+    #[OA\Response(
+        response: 200,
+        description: 'Returns detailed per-testcase output (input/expected/actual/diff) and compile output for the given judgement'
+    )]
+    #[OA\Parameter(ref: '#/components/parameters/id')]
+    public function detailAction(Request $request, string $id): Response
+    {
+        /** @var Judging|null $judging */
+        $judging = $this->em->createQueryBuilder()
+            ->from(Judging::class, 'j')
+            ->select('j')
+            ->andWhere('j.judgingid = :id')
+            ->setParameter('id', $id)
+            ->getQuery()
+            ->getOneOrNullResult();
+
+        if ($judging === null) {
+            throw new NotFoundHttpException(sprintf("Judging with ID '%s' not found", $id));
+        }
+
+        $testcases = $this->em->createQueryBuilder()
+            ->from(Testcase::class, 't')
+            ->join('t.content', 'tc')
+            ->leftJoin('t.judging_runs', 'jr', Join::WITH, 'jr.judging = :judging')
+            ->leftJoin('jr.output', 'jro')
+            ->select('t, jr, tc, jro')
+            ->andWhere('t.problem = :problem')
+            ->setParameter('judging', $judging)
+            ->setParameter('problem', $judging->getSubmission()->getProblem())
+            ->orderBy('t.ranknumber')
+            ->getQuery()
+            ->getResult();
+
+        $runData = [];
+        foreach ($testcases as $testcase) {
+            /** @var Testcase $testcase */
+            $run = $testcase->getFirstJudgingRun();
+            $content = $testcase->getContent();
+            $output = $run?->getOutput();
+            $runData[] = [
+                'ordinal' => $testcase->getRank(),
+                'judgement_type_id' => $run?->getRunresult() ? ($this->verdicts[$run->getRunresult()] ?? $run->getRunresult()) : null,
+                'runtime' => $run?->getRuntime(),
+                'testcase_input' => $content ? $content->getInput() : null,
+                'expected_output' => $content ? $content->getOutput() : null,
+                'output_run' => $output?->getOutputRun(),
+                'output_diff' => $output?->getOutputDiff(),
+                'output_error' => $output?->getOutputError(),
+            ];
+        }
+
+        $result = [
+            'id' => (string)$judging->getJudgingid(),
+            'judgement_type_id' => $judging->getResult() ? ($this->verdicts[$judging->getResult()] ?? $judging->getResult()) : null,
+            'output_compile' => $judging->getOutputCompile(true),
+            'runs' => $runData,
+        ];
+
+        return new Response(json_encode($result), 200, ['Content-Type' => 'application/json']);
     }
 
     protected function getQueryBuilder(Request $request): QueryBuilder
