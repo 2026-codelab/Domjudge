@@ -4,10 +4,12 @@ namespace App\Controller\API;
 
 use App\DataTransferObject\JudgingWrapper;
 use App\Entity\Judging;
+use App\Entity\JudgingRunOutput;
 use App\Entity\Testcase;
 use App\Service\ConfigurationService;
 use App\Service\DOMJudgeService;
 use App\Service\EventLogService;
+use App\Utils\Utils;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\NonUniqueResultException;
 use Doctrine\ORM\Query\Expr\Join;
@@ -105,13 +107,19 @@ class JudgementController extends AbstractRestController implements QueryObjectT
      * H-CodeLab connector custom endpoint.
      * The stock DOMjudge API has no endpoint exposing per-testcase actual output/diff/compile
      * log, so this mirrors the query Team/SubmissionController uses and exposes it as JSON.
+     *
+     * Contract expected by H-CodeLab BE (DomjudgeService#getResultOutput / Output.java):
+     * - {id} is the SUBMISSION id; the latest valid judging of that submission is used.
+     * - runs[]: testcase_rank, result (raw run result, e.g. "correct"; null while pending),
+     *   runtime (seconds), memory_used (bytes), output, output_error, output_diff,
+     *   testcase_input, expected_output.
      * @throws NonUniqueResultException
      */
     #[IsGranted(new Expression("is_granted('ROLE_JURY') or is_granted('ROLE_API_READER')"))]
-    #[Rest\Get('contests/{cid}/judgements/{id<\d+>}/detail')]
+    #[Rest\Get('contests/{cid}/judgements/{id<\d+>}/output')]
     #[OA\Response(
         response: 200,
-        description: 'Returns detailed per-testcase output (input/expected/actual/diff) and compile output for the given judgement'
+        description: 'Returns detailed per-testcase output (input/expected/actual/diff) and compile output for the latest valid judging of the given submission'
     )]
     #[OA\Parameter(ref: '#/components/parameters/id')]
     public function detailAction(Request $request, string $id): Response
@@ -120,13 +128,18 @@ class JudgementController extends AbstractRestController implements QueryObjectT
         $judging = $this->em->createQueryBuilder()
             ->from(Judging::class, 'j')
             ->select('j')
-            ->andWhere('j.judgingid = :id')
-            ->setParameter('id', $id)
+            ->andWhere('j.submission = :submission')
+            ->andWhere('j.contest = :cid')
+            ->andWhere('j.valid = 1')
+            ->setParameter('submission', $id)
+            ->setParameter('cid', $this->getContestId($request))
+            ->orderBy('j.judgingid', 'DESC')
+            ->setMaxResults(1)
             ->getQuery()
             ->getOneOrNullResult();
 
         if ($judging === null) {
-            throw new NotFoundHttpException(sprintf("Judging with ID '%s' not found", $id));
+            throw new NotFoundHttpException(sprintf("No judging found for submission '%s'", $id));
         }
 
         $testcases = $this->em->createQueryBuilder()
@@ -148,15 +161,26 @@ class JudgementController extends AbstractRestController implements QueryObjectT
             $run = $testcase->getFirstJudgingRun();
             $content = $testcase->getContent();
             $output = $run?->getOutput();
+
+            $memoryUsed = null;
+            $rawMetadata = $output ? $this->rawMetadata($output) : null;
+            if ($rawMetadata !== null && $rawMetadata !== '') {
+                $metadata = Utils::parseMetadata($rawMetadata);
+                if (isset($metadata['memory-bytes'])) {
+                    $memoryUsed = (int)$metadata['memory-bytes'];
+                }
+            }
+
             $runData[] = [
-                'ordinal' => $testcase->getRank(),
-                'judgement_type_id' => $run?->getRunresult() ? ($this->verdicts[$run->getRunresult()] ?? $run->getRunresult()) : null,
+                'testcase_rank' => $testcase->getRank(),
+                'result' => $run?->getRunresult(),
                 'runtime' => $run?->getRuntime(),
+                'memory_used' => $memoryUsed,
+                'output' => $output?->getOutputRun(),
+                'output_error' => $output?->getOutputError(),
+                'output_diff' => $output?->getOutputDiff(),
                 'testcase_input' => $content ? $content->getInput() : null,
                 'expected_output' => $content ? $content->getOutput() : null,
-                'output_run' => $output?->getOutputRun(),
-                'output_diff' => $output?->getOutputDiff(),
-                'output_error' => $output?->getOutputError(),
             ];
         }
 
@@ -168,6 +192,18 @@ class JudgementController extends AbstractRestController implements QueryObjectT
         ];
 
         return new Response(json_encode($result), 200, ['Content-Type' => 'application/json']);
+    }
+
+    /**
+     * JudgingRunOutput::getMetadata() is typed as string but the column is nullable.
+     */
+    private function rawMetadata(JudgingRunOutput $output): ?string
+    {
+        try {
+            return $output->getMetadata();
+        } catch (\TypeError) {
+            return null;
+        }
     }
 
     protected function getQueryBuilder(Request $request): QueryBuilder
