@@ -4,11 +4,15 @@ namespace App\Controller\API;
 
 use App\DataTransferObject\JudgingWrapper;
 use App\Entity\Judging;
+use App\Entity\JudgingRunOutput;
+use App\Entity\Testcase;
 use App\Service\ConfigurationService;
 use App\Service\DOMJudgeService;
 use App\Service\EventLogService;
+use App\Utils\Utils;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\NonUniqueResultException;
+use Doctrine\ORM\Query\Expr\Join;
 use Doctrine\ORM\QueryBuilder;
 use FOS\RestBundle\Controller\Annotations as Rest;
 use Nelmio\ApiDocBundle\Attribute\Model;
@@ -16,6 +20,7 @@ use OpenApi\Attributes as OA;
 use Symfony\Component\ExpressionLanguage\Expression;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\Security\Http\Attribute\IsGranted;
 
 /**
@@ -96,6 +101,109 @@ class JudgementController extends AbstractRestController implements QueryObjectT
     public function singleAction(Request $request, string $id): Response
     {
         return parent::performSingleAction($request, $id);
+    }
+
+    /**
+     * H-CodeLab connector custom endpoint.
+     * The stock DOMjudge API has no endpoint exposing per-testcase actual output/diff/compile
+     * log, so this mirrors the query Team/SubmissionController uses and exposes it as JSON.
+     *
+     * Contract expected by H-CodeLab BE (DomjudgeService#getResultOutput / Output.java):
+     * - {id} is the SUBMISSION id; the latest valid judging of that submission is used.
+     * - runs[]: testcase_rank, result (raw run result, e.g. "correct"; null while pending),
+     *   runtime (seconds), memory_used (bytes), output, output_error, output_diff,
+     *   testcase_input, expected_output.
+     * @throws NonUniqueResultException
+     */
+    #[IsGranted(new Expression("is_granted('ROLE_JURY') or is_granted('ROLE_API_READER')"))]
+    #[Rest\Get('contests/{cid}/judgements/{id<\d+>}/output')]
+    #[OA\Response(
+        response: 200,
+        description: 'Returns detailed per-testcase output (input/expected/actual/diff) and compile output for the latest valid judging of the given submission'
+    )]
+    #[OA\Parameter(ref: '#/components/parameters/id')]
+    public function detailAction(Request $request, string $id): Response
+    {
+        /** @var Judging|null $judging */
+        $judging = $this->em->createQueryBuilder()
+            ->from(Judging::class, 'j')
+            ->select('j')
+            ->andWhere('j.submission = :submission')
+            ->andWhere('j.contest = :cid')
+            ->andWhere('j.valid = 1')
+            ->setParameter('submission', $id)
+            ->setParameter('cid', $this->getContestId($request))
+            ->orderBy('j.judgingid', 'DESC')
+            ->setMaxResults(1)
+            ->getQuery()
+            ->getOneOrNullResult();
+
+        if ($judging === null) {
+            throw new NotFoundHttpException(sprintf("No judging found for submission '%s'", $id));
+        }
+
+        $testcases = $this->em->createQueryBuilder()
+            ->from(Testcase::class, 't')
+            ->join('t.content', 'tc')
+            ->leftJoin('t.judging_runs', 'jr', Join::WITH, 'jr.judging = :judging')
+            ->leftJoin('jr.output', 'jro')
+            ->select('t, jr, tc, jro')
+            ->andWhere('t.problem = :problem')
+            ->setParameter('judging', $judging)
+            ->setParameter('problem', $judging->getSubmission()->getProblem())
+            ->orderBy('t.ranknumber')
+            ->getQuery()
+            ->getResult();
+
+        $runData = [];
+        foreach ($testcases as $testcase) {
+            /** @var Testcase $testcase */
+            $run = $testcase->getFirstJudgingRun();
+            $content = $testcase->getContent();
+            $output = $run?->getOutput();
+
+            $memoryUsed = null;
+            $rawMetadata = $output ? $this->rawMetadata($output) : null;
+            if ($rawMetadata !== null && $rawMetadata !== '') {
+                $metadata = Utils::parseMetadata($rawMetadata);
+                if (isset($metadata['memory-bytes'])) {
+                    $memoryUsed = (int)$metadata['memory-bytes'];
+                }
+            }
+
+            $runData[] = [
+                'testcase_rank' => $testcase->getRank(),
+                'result' => $run?->getRunresult(),
+                'runtime' => $run?->getRuntime(),
+                'memory_used' => $memoryUsed,
+                'output' => $output?->getOutputRun(),
+                'output_error' => $output?->getOutputError(),
+                'output_diff' => $output?->getOutputDiff(),
+                'testcase_input' => $content ? $content->getInput() : null,
+                'expected_output' => $content ? $content->getOutput() : null,
+            ];
+        }
+
+        $result = [
+            'id' => (string)$judging->getJudgingid(),
+            'judgement_type_id' => $judging->getResult() ? ($this->verdicts[$judging->getResult()] ?? $judging->getResult()) : null,
+            'output_compile' => $judging->getOutputCompile(true),
+            'runs' => $runData,
+        ];
+
+        return new Response(json_encode($result), 200, ['Content-Type' => 'application/json']);
+    }
+
+    /**
+     * JudgingRunOutput::getMetadata() is typed as string but the column is nullable.
+     */
+    private function rawMetadata(JudgingRunOutput $output): ?string
+    {
+        try {
+            return $output->getMetadata();
+        } catch (\TypeError) {
+            return null;
+        }
     }
 
     protected function getQueryBuilder(Request $request): QueryBuilder
